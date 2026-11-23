@@ -1,6 +1,9 @@
--- The package's three entry points, each downloading a real video: the Lua API, the command line
--- of an `lde compile`d executable, and the C API of an `lde compile --shared` library driven from
--- C. These need the network, `lde` on PATH and a C compiler.
+-- The package's three entry points: the Lua API, the command line of an `lde compile`d executable,
+-- and the C API of an `lde compile --shared` library driven from C. These need the network, `lde`
+-- on PATH and a C compiler.
+--
+-- Skipped on GitHub Actions: YouTube answers its runners' datacenter addresses with a bot check
+-- ("Sign in to confirm you're not a bot") for every client yt can use without signing in.
 local test = require("lde-test")
 local fs = require("fs")
 local path = require("path")
@@ -17,6 +20,8 @@ local root = debug.getinfo(1, "S").source:sub(2):match("^(.*)[/\\]tests[/\\]") o
 local tmp = os.getenv("TMPDIR") or os.getenv("TEMP") or os.getenv("TMP") or "/tmp"
 local out = path.join(tmp, "yt-entrypoints")
 fs.mkdirAll(out)
+
+local onGithub = os.getenv("GITHUB_ACTIONS") == "true"
 
 ---@param name string
 ---@param args string[]
@@ -50,40 +55,19 @@ local function size(file)
 	return content and #content or 0
 end
 
-test.it("downloads through the Lua API", function()
-	local dl = yt.new()
-	local info, err = dl:info("https://www.youtube.com/watch?v=" .. VIDEO)
-	test.truthy(info, tostring(err))
-	---@cast info yt.Info
-	test.equal(info.id, VIDEO)
-	test.truthy(#info.formats > 0, "the video has audio formats")
-
-	local file, downloadErr, _, format = dl:downloadAudio(VIDEO, out, "webm")
-	dl:close()
-	test.truthy(file, tostring(downloadErr))
-	---@cast file string
-	---@cast format yt.Format
-	test.equal(format.container, "webm")
-	test.equal(size(file), format.size)
-end)
-
-test.it("downloads through a compiled command line", function()
+--- The executable `lde compile` builds.
+---@return string
+local function cliExecutable()
 	local exe = path.join(out, isWindows and "yt.exe" or "yt")
 	local code, output = run("lde", { "compile", "--outfile", exe })
 	test.equal(code, 0, output)
+	return exe
+end
 
-	local dir = path.join(out, "cli")
-	fs.mkdirAll(dir)
-	code, output = run(exe, { VIDEO, dir })
-	test.equal(code, 0, output)
-	local file = output:match("([^\r\n]*" .. VIDEO .. "%.%w+)") --[[@as string?]]
-	test.truthy(file and size(file) > 0, "the printed path holds the audio: " .. output)
-
-	code = run(exe, {})
-	test.equal(code, 2)
-end)
-
-test.it("downloads through the C API of a shared library", function()
+--- tests/c/download.c, built against the library `lde compile --shared` builds.
+---@return string exe
+---@return string lib
+local function cProgram()
 	local ext = isWindows and "dll" or (jit.os == "OSX" and "dylib" or "so")
 	local lib = path.join(out, "libyt." .. ext)
 	local code, output = run("lde", { "compile", "--shared", "--outfile", lib })
@@ -94,12 +78,45 @@ test.it("downloads through the C API of a shared library", function()
 	if jit.os == "Linux" then args[#args + 1] = "-ldl" end
 	code, output = run(compiler(), args)
 	test.equal(code, 0, output)
+	return exe, lib
+end
 
+test.skipIf(onGithub)("downloads through the Lua API", function()
+	local dl = yt.new()
+	local info, err = dl:info("https://www.youtube.com/watch?v=" .. VIDEO)
+	test.truthy(info, tostring(err))
+	test.equal(info.id, VIDEO)
+	test.greater(#info.formats, 0)
+
+	local file, downloadErr, _, format = dl:downloadAudio(VIDEO, out, "webm")
+	dl:close()
+	test.truthy(file, tostring(downloadErr))
+	---@cast file string
+	---@cast format yt.Format
+	test.equal(format.container, "webm")
+	test.equal(size(file), format.size)
+end)
+
+test.skipIf(onGithub)("downloads through a compiled command line", function()
+	local exe = cliExecutable()
+	local dir = path.join(out, "cli")
+	fs.mkdirAll(dir)
+	local code, output = run(exe, { VIDEO, dir })
+	test.equal(code, 0, output)
+	local file = output:match("([^\r\n]*" .. VIDEO .. "%.%w+)") --[[@as string?]]
+	test.truthy(file and size(file) > 0, "the printed path holds the audio: " .. output)
+
+	code = run(exe, {})
+	test.equal(code, 2)
+end)
+
+test.skipIf(onGithub)("downloads through the C API of a shared library", function()
+	local exe, lib = cProgram()
 	local dir = path.join(out, "c")
 	fs.mkdirAll(dir)
-	code, output = run(exe, { lib, VIDEO, dir })
+	local code, output = run(exe, { lib, VIDEO, dir })
 	test.equal(code, 0, output)
-	test.truthy(output:find('"id":"' .. VIDEO .. '"', 1, true), "yt_info returned the video's JSON: " .. output)
+	test.includes(output, '"id":"' .. VIDEO .. '"', "yt_info returned the video's JSON")
 	local file = output:match("([^\r\n]*" .. VIDEO .. "%.%w+)%s*$") --[[@as string?]]
 	test.truthy(file and size(file) > 0, "yt_download returned the audio's path: " .. output)
 end)
